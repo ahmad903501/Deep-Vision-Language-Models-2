@@ -36,7 +36,8 @@ class ValueModel(nn.Module):
             output_hidden_states=True,
         )
         hidden = outputs.hidden_states[-1]        # (B, T, d_model)
-        values = self.value_head(hidden).squeeze(-1)  # (B, T)
+        # Cast to match value_head dtype (avoids bf16 vs f32 mismatch)
+        values = self.value_head(hidden.to(self.value_head.weight.dtype)).squeeze(-1)
         return values
 
 
@@ -62,6 +63,7 @@ def load_value_model(
         torch_dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
+        resume_download=True,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.value_model_name)
@@ -77,6 +79,9 @@ def load_value_model(
         backbone = apply_lora(backbone, lora_cfg, task_type="CAUSAL_LM")
 
     value_model = ValueModel(backbone, hidden_size)
+
+    # Cast value head to match backbone dtype (avoids bf16 vs f32 mismatch)
+    value_model.value_head = value_model.value_head.to(dtype)
 
     if bnb is None:
         value_model = value_model.to(model_cfg.device)

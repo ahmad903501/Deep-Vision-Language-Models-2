@@ -50,6 +50,7 @@ def load_policy_model(
         torch_dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
+        resume_download=True,
     )
     if bnb is None:
         model = model.to(model_cfg.device)
@@ -83,6 +84,7 @@ def load_rm_backbone(
         torch_dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
+        resume_download=True,
     )
     if bnb is None:
         model = model.to(model_cfg.device)
