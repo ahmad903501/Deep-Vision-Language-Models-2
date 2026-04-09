@@ -36,6 +36,8 @@ class ValueModel(nn.Module):
             output_hidden_states=True,
         )
         hidden = outputs.hidden_states[-1]        # (B, T, d_model)
+        # Cast hidden to value_head dtype to avoid bf16/f32 mismatch
+        hidden = hidden.to(self.value_head.weight.dtype)
         values = self.value_head(hidden).squeeze(-1)  # (B, T)
         return values
 
