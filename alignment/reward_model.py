@@ -68,6 +68,38 @@ def get_rm_scores(
     return outputs.logits.squeeze(-1)  # (B,)
 
 
+def get_rm_scores_headonly(
+    rm_model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Head-only forward: backbone runs under no_grad, only score head gets gradients.
+
+    This avoids building a computation graph through the entire frozen backbone,
+    making backward() essentially free (only ~2048 params in the linear head).
+    """
+    # 1) Forward through frozen backbone — no graph needed
+    with torch.no_grad():
+        backbone = rm_model.model  # LlamaModel inside AutoModelForSequenceClassification
+        transformer_outputs = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        hidden_states = transformer_outputs[0]  # (B, seq_len, hidden_dim)
+
+    # 2) Detach so backward stops here, then cast dtype for score head
+    hidden_states = hidden_states.detach().to(rm_model.score.weight.dtype)
+
+    # 3) Forward through the trainable score head
+    logits = rm_model.score(hidden_states)  # (B, seq_len, 1)
+
+    # 4) Pool at the last non-pad token (same logic as AutoModelForSequenceClassification)
+    batch_size = input_ids.shape[0]
+    sequence_lengths = (attention_mask.sum(dim=1) - 1).long()  # last real token idx
+    pooled = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+    return pooled.squeeze(-1)  # (B,)
+
+
 # ---------------------------------------------------------------------------
 # Bradley-Terry loss with L2 regularization
 # ---------------------------------------------------------------------------
@@ -116,11 +148,9 @@ def train_reward_model(
     Returns dict of metrics: {train_loss, train_acc, eval_loss, eval_acc}.
     """
     rm_model.train()
-    # Enable gradient checkpointing to reduce VRAM for Llama-1B backbone
-    if hasattr(rm_model, 'gradient_checkpointing_enable'):
-        rm_model.gradient_checkpointing_enable()
-    elif hasattr(rm_model, 'base_model') and hasattr(rm_model.base_model, 'gradient_checkpointing_enable'):
-        rm_model.base_model.gradient_checkpointing_enable()
+    # NOTE: gradient checkpointing is NOT used for head-only training.
+    # The backbone is frozen so there are no optimizer states to save memory on,
+    # and checkpointing would only add recomputation overhead (~3-5x slower).
 
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, rm_model.parameters()),
@@ -152,8 +182,8 @@ def train_reward_model(
             rejected_ids = batch["rejected_input_ids"].to(device)
             rejected_mask = batch["rejected_attention_mask"].to(device)
 
-            r_chosen = get_rm_scores(rm_model, chosen_ids, chosen_mask)
-            r_rejected = get_rm_scores(rm_model, rejected_ids, rejected_mask)
+            r_chosen = get_rm_scores_headonly(rm_model, chosen_ids, chosen_mask)
+            r_rejected = get_rm_scores_headonly(rm_model, rejected_ids, rejected_mask)
 
             loss, acc = rm_loss_fn(r_chosen, r_rejected, cfg.lambda_reg)
 
