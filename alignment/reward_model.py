@@ -133,6 +133,46 @@ def rm_loss_fn(
 
 
 # ---------------------------------------------------------------------------
+# Precompute hidden states (one-time backbone pass)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _precompute_embeddings(
+    rm_model: nn.Module,
+    data_loader: DataLoader,
+    device: str = "cuda",
+    desc: str = "[RM] Precomputing embeddings",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the frozen backbone once over the dataset and cache the pooled hidden state
+    at the last non-pad token for each chosen and rejected sequence.
+
+    Returns:
+        chosen_embeds:   (N, hidden_dim) on CPU
+        rejected_embeds: (N, hidden_dim) on CPU
+    """
+    rm_model.eval()
+    backbone = rm_model.model  # LlamaModel inside AutoModelForSequenceClassification
+
+    all_chosen = []
+    all_rejected = []
+
+    for batch in tqdm(data_loader, desc=desc):
+        for key_prefix, accumulator in [("chosen", all_chosen), ("rejected", all_rejected)]:
+            ids = batch[f"{key_prefix}_input_ids"].to(device)
+            mask = batch[f"{key_prefix}_attention_mask"].to(device)
+
+            out = backbone(input_ids=ids, attention_mask=mask)
+            hidden = out[0]  # (B, seq_len, hidden_dim)
+
+            # Pool at last real token
+            seq_lengths = mask.sum(dim=1) - 1  # (B,)
+            pooled = hidden[torch.arange(hidden.size(0), device=device), seq_lengths]
+            accumulator.append(pooled.cpu().float())  # store in fp32 on CPU
+
+    return torch.cat(all_chosen), torch.cat(all_rejected)
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -143,23 +183,48 @@ def train_reward_model(
     cfg: RMConfig,
     device: str = "cuda",
 ) -> dict:
-    """Train the reward model for 1 epoch with Bradley-Terry loss.
+    """Train the reward model head on precomputed backbone embeddings.
+
+    Strategy: Since only the (hidden_dim → 1) score head is trainable and
+    the backbone is frozen, we precompute hidden states in one pass (~20 min),
+    then train the head on cached embeddings (seconds).
 
     Returns dict of metrics: {train_loss, train_acc, eval_loss, eval_acc}.
     """
-    rm_model.train()
-    # NOTE: gradient checkpointing is NOT used for head-only training.
-    # The backbone is frozen so there are no optimizer states to save memory on,
-    # and checkpointing would only add recomputation overhead (~3-5x slower).
+
+    # =====================================================================
+    # Phase 1: Precompute embeddings (one forward pass through backbone)
+    # =====================================================================
+    print("[RM] Phase 1/2: Precomputing backbone embeddings (one-time cost)...")
+    train_chosen_emb, train_rejected_emb = _precompute_embeddings(
+        rm_model, train_loader, device, desc="[RM] Precomputing train embeddings"
+    )
+    print(f"  Cached {train_chosen_emb.shape[0]} pairs, dim={train_chosen_emb.shape[1]}")
+
+    eval_chosen_emb, eval_rejected_emb = None, None
+    if eval_loader is not None:
+        eval_chosen_emb, eval_rejected_emb = _precompute_embeddings(
+            rm_model, eval_loader, device, desc="[RM] Precomputing eval embeddings"
+        )
+        print(f"  Cached {eval_chosen_emb.shape[0]} eval pairs")
+
+    # =====================================================================
+    # Phase 2: Train the score head on cached embeddings
+    # =====================================================================
+    print("[RM] Phase 2/2: Training score head on cached embeddings...")
+    score_head = rm_model.score  # nn.Linear(hidden_dim, 1)
+    score_head.train()
 
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, rm_model.parameters()),
+        score_head.parameters(),
         lr=cfg.lr,
         weight_decay=cfg.weight_decay,
     )
 
-    # --- Linear warmup scheduler ---
-    total_steps = len(train_loader) * cfg.epochs
+    n_train = train_chosen_emb.shape[0]
+    total_steps = (n_train // cfg.batch_size) * cfg.epochs
+    step_count = 0
+
     def lr_lambda(current_step: int) -> float:
         if current_step < cfg.warmup_steps:
             return current_step / max(1, cfg.warmup_steps)
@@ -167,23 +232,27 @@ def train_reward_model(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Accumulators
     running_loss = 0.0
     running_acc = 0.0
-    global_step = 0
-    best_eval_acc = 0.0
     metrics: dict = {}
 
     for epoch in range(cfg.epochs):
-        pbar = tqdm(train_loader, desc=f"[RM] Epoch {epoch+1}/{cfg.epochs}", total=len(train_loader))
-        for batch in pbar:
-            chosen_ids = batch["chosen_input_ids"].to(device)
-            chosen_mask = batch["chosen_attention_mask"].to(device)
-            rejected_ids = batch["rejected_input_ids"].to(device)
-            rejected_mask = batch["rejected_attention_mask"].to(device)
+        # Shuffle training pairs
+        perm = torch.randperm(n_train)
+        train_chosen_emb = train_chosen_emb[perm]
+        train_rejected_emb = train_rejected_emb[perm]
 
-            r_chosen = get_rm_scores_headonly(rm_model, chosen_ids, chosen_mask)
-            r_rejected = get_rm_scores_headonly(rm_model, rejected_ids, rejected_mask)
+        n_batches = n_train // cfg.batch_size
+        pbar = tqdm(range(n_batches), desc=f"[RM] Head training epoch {epoch+1}/{cfg.epochs}")
+        for i in pbar:
+            start = i * cfg.batch_size
+            end = start + cfg.batch_size
+
+            c_emb = train_chosen_emb[start:end].to(device).to(score_head.weight.dtype)
+            r_emb = train_rejected_emb[start:end].to(device).to(score_head.weight.dtype)
+
+            r_chosen = score_head(c_emb).squeeze(-1)     # (B,)
+            r_rejected = score_head(r_emb).squeeze(-1)    # (B,)
 
             loss, acc = rm_loss_fn(r_chosen, r_rejected, cfg.lambda_reg)
 
@@ -194,16 +263,15 @@ def train_reward_model(
 
             running_loss += loss.item()
             running_acc += acc.item()
-            global_step += 1
+            step_count += 1
 
-            # Update progress bar
             pbar.set_postfix(loss=loss.item(), acc=acc.item(), lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
-            if global_step % cfg.log_every == 0:
+            if step_count % cfg.log_every == 0:
                 avg_loss = running_loss / cfg.log_every
                 avg_acc = running_acc / cfg.log_every
                 tqdm.write(
-                    f"  [RM] step {global_step}/{total_steps} | "
+                    f"  [RM] step {step_count}/{total_steps} | "
                     f"loss={avg_loss:.4f} | acc={avg_acc:.4f} | "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
@@ -212,23 +280,39 @@ def train_reward_model(
         pbar.close()
 
     # --- Final train metrics ---
-    metrics["train_loss"] = loss.item()  # last batch
-    metrics["train_steps"] = global_step
+    metrics["train_loss"] = loss.item()
+    metrics["train_steps"] = step_count
 
-    # --- Eval ---
-    if eval_loader is not None:
-        eval_loss, eval_acc, r_chosen_all, r_rejected_all = evaluate_rm(
-            rm_model, eval_loader, cfg.lambda_reg, device
-        )
-        metrics["eval_loss"] = eval_loss
-        metrics["eval_acc"] = eval_acc
-        metrics["r_chosen_mean"] = r_chosen_all.mean().item()
-        metrics["r_rejected_mean"] = r_rejected_all.mean().item()
-        print(
-            f"  [RM] Eval | loss={eval_loss:.4f} | acc={eval_acc:.4f} | "
-            f"r+_mean={metrics['r_chosen_mean']:.3f} | "
-            f"r-_mean={metrics['r_rejected_mean']:.3f}"
-        )
+    # --- Eval on cached embeddings ---
+    if eval_chosen_emb is not None:
+        score_head.eval()
+        with torch.no_grad():
+            all_r_chosen, all_r_rejected = [], []
+            n_eval = eval_chosen_emb.shape[0]
+            total_loss, total_acc, n_batches = 0.0, 0.0, 0
+            for i in range(0, n_eval, cfg.batch_size):
+                c_emb = eval_chosen_emb[i:i+cfg.batch_size].to(device).to(score_head.weight.dtype)
+                r_emb = eval_rejected_emb[i:i+cfg.batch_size].to(device).to(score_head.weight.dtype)
+                rc = score_head(c_emb).squeeze(-1)
+                rr = score_head(r_emb).squeeze(-1)
+                loss, acc = rm_loss_fn(rc, rr, cfg.lambda_reg)
+                total_loss += loss.item()
+                total_acc += acc.item()
+                n_batches += 1
+                all_r_chosen.append(rc.cpu())
+                all_r_rejected.append(rr.cpu())
+
+            metrics["eval_loss"] = total_loss / max(n_batches, 1)
+            metrics["eval_acc"] = total_acc / max(n_batches, 1)
+            metrics["r_chosen_all"] = torch.cat(all_r_chosen)
+            metrics["r_rejected_all"] = torch.cat(all_r_rejected)
+            metrics["r_chosen_mean"] = metrics["r_chosen_all"].mean().item()
+            metrics["r_rejected_mean"] = metrics["r_rejected_all"].mean().item()
+            print(
+                f"  [RM] Eval | loss={metrics['eval_loss']:.4f} | acc={metrics['eval_acc']:.4f} | "
+                f"r+_mean={metrics['r_chosen_mean']:.3f} | "
+                f"r-_mean={metrics['r_rejected_mean']:.3f}"
+            )
 
     # Freeze after training
     rm_model.eval()
