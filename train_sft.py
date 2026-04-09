@@ -1,82 +1,55 @@
-from __future__ import annotations
+"""
+Entry point: Supervised Fine-Tuning (Task C2).
 
-import os
-import random
-
+Usage:
+    python train_sft.py
+"""
 import torch
-
-from src.config import default_experiment_config
-from src.data import build_dataloaders, load_hh_harmless_dataset, parse_hh_split
-from src.models import create_model_bundle
-from src.trainers import (
-    evaluate_sft_perplexity,
-    generate_sft_samples,
-    save_sft_artifacts,
-    train_sft,
-)
+from config import Config
+from data.hh_rlhf import load_hh_rlhf, SFTDataset
+from data.collators import PolicyCollator
+from model.loader import load_policy_model, apply_lora
+from alignment.sft import train_sft
+from utils.checkpoint import save_checkpoint
+from utils.logging import MetricLogger
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def main():
+    cfg = Config()
+    torch.manual_seed(cfg.seed)
 
+    # --- Data ---
+    print("[C2] Loading HH-RLHF data...")
+    train_data = load_hh_rlhf(subset=cfg.data.dataset_subset, split="train")
+    test_data = load_hh_rlhf(subset=cfg.data.dataset_subset, split="test")
 
-def main() -> None:
-    cfg = default_experiment_config()
-    set_seed(cfg.seed)
+    train_ds = SFTDataset(train_data, max_samples=cfg.sft.max_train_samples)
+    test_ds = SFTDataset(test_data)
 
-    dataset = load_hh_harmless_dataset(
-        dataset_name=cfg.data.hh_dataset_name,
-        harmless_config=cfg.data.hh_harmless_config,
+    # --- Model ---
+    print("[C2] Loading policy model...")
+    model, tokenizer = load_policy_model(cfg.model)
+    model.gradient_checkpointing_enable()
+    model = apply_lora(model, cfg.lora, task_type="CAUSAL_LM")
+
+    # --- Collator + DataLoader ---
+    collator = PolicyCollator(tokenizer, max_length=cfg.data.max_seq_length)
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=cfg.sft.batch_size, shuffle=True,
+        collate_fn=collator.collate_sft,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_ds, batch_size=cfg.sft.batch_size, shuffle=False,
+        collate_fn=collator.collate_sft,
     )
 
-    train_triples = parse_hh_split(dataset["train"], skip_invalid=False)
-    test_triples = parse_hh_split(dataset["test"], skip_invalid=False)
+    # --- Train ---
+    print("[C2] Training SFT...")
+    metrics = train_sft(model, train_loader, test_loader, cfg.sft)
 
-    bundle = create_model_bundle(cfg)
-
-    train_loaders = build_dataloaders(train_triples, bundle.policy_tokenizer, bundle.rm_tokenizer, cfg.data)
-    test_loaders = build_dataloaders(test_triples, bundle.policy_tokenizer, bundle.rm_tokenizer, cfg.data)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    train_metrics = train_sft(bundle.policy_model, train_loaders["sft"], cfg, device=device)
-    ppl = evaluate_sft_perplexity(
-        bundle.policy_model,
-        test_loaders["sft"],
-        device=device,
-        max_batches=20,
-    )
-
-    prompts = [tri.prompt for tri in test_triples[:5]]
-    samples = generate_sft_samples(
-        bundle.policy_model,
-        bundle.policy_tokenizer,
-        prompts,
-        device=device,
-        max_new_tokens=cfg.sft_train.sample_gen_max_new_tokens,
-    )
-
-    artifacts = save_sft_artifacts(
-        bundle.policy_model,
-        bundle.policy_tokenizer,
-        output_dir=os.path.join("artifacts", "sft"),
-        base_checkpoint_name=cfg.model.policy_model_name,
-    )
-
-    print("\n=== SFT TRAIN METRICS ===")
-    print(train_metrics)
-    print("Held-out perplexity:", ppl)
-
-    print("\n=== SFT SAMPLE OUTPUTS ===")
-    for i, sample in enumerate(samples, start=1):
-        print(f"\n--- sample {i} ---")
-        print(sample)
-
-    print("\nSaved SFT artifacts:")
-    print(artifacts)
+    # --- Save as both π_ref (frozen) and π_θ^(0) (trainable) ---
+    save_checkpoint(model, None, f"{cfg.checkpoint_dir}/sft", source_method="sft")
+    print("[C2] Done. SFT checkpoint saved.")
 
 
 if __name__ == "__main__":

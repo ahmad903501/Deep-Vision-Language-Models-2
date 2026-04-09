@@ -1,20 +1,45 @@
-# Python virtual environments
-.venv/
-venv/
-
-# Python cache/compiled files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.egg-info/
+dist/
+build/
 
-# Tool caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Virtual environment
+.venv/
 
-# Jupyter checkpoints
+# IDE
+.vscode/
+.idea/
+
+# Outputs
+outputs/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Data caches
+.cache/
+
+# Jupyter
 .ipynb_checkpoints/
 
-# OS/editor noise
+# OS
 .DS_Store
 Thumbs.db
+
+# Pytest
+.pytest_cache/
+
+# Verification / debug scripts (not needed in repo)
+scripts/
+
+# Tests (local only)
+tests/
+
+# Assignment PDF
+DVLM_PA2.pdf
+
+
+notebooks/
