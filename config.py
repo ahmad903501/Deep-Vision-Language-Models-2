@@ -72,7 +72,7 @@ class SFTConfig:
 class RMConfig:
     epochs: int = 1
     batch_size: int = 8
-    lr: float = 1e-5
+    lr: float = 1e-3
     weight_decay: float = 0.01
     warmup_steps: int = 50
     lambda_reg: float = 1e-3
