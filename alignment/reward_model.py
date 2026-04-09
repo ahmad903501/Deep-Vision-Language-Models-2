@@ -115,6 +115,12 @@ def train_reward_model(
     Returns dict of metrics: {train_loss, train_acc, eval_loss, eval_acc}.
     """
     rm_model.train()
+    # Enable gradient checkpointing to reduce VRAM for Llama-1B backbone
+    if hasattr(rm_model, 'gradient_checkpointing_enable'):
+        rm_model.gradient_checkpointing_enable()
+    elif hasattr(rm_model, 'base_model') and hasattr(rm_model.base_model, 'gradient_checkpointing_enable'):
+        rm_model.base_model.gradient_checkpointing_enable()
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, rm_model.parameters()),
         lr=cfg.lr,
