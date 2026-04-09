@@ -2,10 +2,7 @@ from dataclasses import dataclass
 import re
 
 
-ROLE_TURN_REGEX = re.compile(
-    r"(?:^|\n)\s*(Human|Assistant):\s*(.*?)(?=(?:\n\s*(?:Human|Assistant):)|\Z)",
-    flags=re.DOTALL,
-)
+ASSISTANT_MARKER_REGEX = re.compile(r"(?m)(?:(?<=^)|(?<=\n))[ \t]*Assistant:")
 
 
 @dataclass
@@ -15,48 +12,22 @@ class PreferenceTriple:
     rejected: str
 
 
-def _extract_turns(conversation: str) -> list[tuple[str, str]]:
-    turns = [(m.group(1), m.group(2).strip()) for m in ROLE_TURN_REGEX.finditer(conversation)]
-    if not turns:
-        raise ValueError("Could not parse Human/Assistant turns from conversation text.")
-    return turns
-
-
-def _render_turns(turns: list[tuple[str, str]]) -> str:
-    rendered = "\n\n".join(f"{role}: {content}" for role, content in turns if content or role)
-    return rendered.strip()
+def _find_last_assistant_marker(conversation: str) -> re.Match:
+    matches = list(ASSISTANT_MARKER_REGEX.finditer(conversation))
+    if not matches:
+        raise ValueError("Could not locate assistant marker in conversation text.")
+    return matches[-1]
 
 
 def split_prompt_response(conversation: str) -> tuple[str, str]:
-    if not conversation or not conversation.strip():
+    if conversation is None or conversation == "":
         raise ValueError("Conversation text is empty.")
 
-    turns = _extract_turns(conversation)
+    marker = _find_last_assistant_marker(conversation)
 
-    final_assistant_idx = None
-    for idx in range(len(turns) - 1, -1, -1):
-        role, content = turns[idx]
-        if role == "Assistant" and content.strip():
-            final_assistant_idx = idx
-            break
-
-    if final_assistant_idx is None:
-        raise ValueError("Could not locate a non-empty final assistant response.")
-
-    response = turns[final_assistant_idx][1].strip()
-    if not response:
-        raise ValueError("Parsed response is empty.")
-
-    prompt_turns = turns[:final_assistant_idx]
-    if not prompt_turns:
-        raise ValueError("Prompt is empty after removing final assistant response.")
-
-    prompt = _render_turns(prompt_turns)
-    if not prompt:
-        raise ValueError("Prompt text is empty after rendering turns.")
-
-    if not prompt.endswith("Assistant:"):
-        prompt = f"{prompt}\n\nAssistant:"
+    # Preserve raw formatting exactly: no stripping or normalization.
+    prompt = conversation[: marker.end()]
+    response = conversation[marker.end() :]
 
     return prompt, response
 
