@@ -26,7 +26,11 @@ class ModelBundle:
 def _resolve_dtype(dtype_name: str) -> torch.dtype:
     if dtype_name not in DTYPE_MAP:
         raise ValueError(f"Unsupported dtype '{dtype_name}'.")
-    return DTYPE_MAP[dtype_name]
+    dtype = DTYPE_MAP[dtype_name]
+    if dtype == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        # P100/T4 class GPUs do not support bf16 efficiently; fp16 is lower-memory and faster there.
+        return torch.float16
+    return dtype
 
 
 def _make_tokenizer(model_name: str, padding_side: str):

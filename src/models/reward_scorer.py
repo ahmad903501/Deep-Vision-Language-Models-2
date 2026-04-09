@@ -17,14 +17,48 @@ DTYPE_MAP = {
 def _resolve_dtype(dtype_name: str) -> torch.dtype:
     if dtype_name not in DTYPE_MAP:
         raise ValueError(f"Unsupported dtype '{dtype_name}'.")
-    return DTYPE_MAP[dtype_name]
+    dtype = DTYPE_MAP[dtype_name]
+    if dtype == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        # P100/T4 class GPUs do not support bf16 efficiently; fp16 is lower-memory and faster there.
+        return torch.float16
+    return dtype
+
+
+def _unwrap_sequence_classifier_model(model):
+    current = model
+    for _ in range(6):
+        if hasattr(current, "score") or hasattr(current, "classifier"):
+            return current
+
+        if hasattr(current, "base_model"):
+            nxt = getattr(current, "base_model")
+            if nxt is not current:
+                current = nxt
+                continue
+
+        if hasattr(current, "model"):
+            nxt = getattr(current, "model")
+            if nxt is not current:
+                current = nxt
+                continue
+
+        break
+
+    raise ValueError("Could not locate sequence-classification model with a known head.")
+
+
+def _backbone_model(seq_cls_model):
+    if hasattr(seq_cls_model, "model"):
+        return seq_cls_model.model
+    return None
 
 
 def _classification_head(model):
-    if hasattr(model, "score"):
-        return model.score
-    if hasattr(model, "classifier"):
-        return model.classifier
+    seq_cls_model = _unwrap_sequence_classifier_model(model)
+    if hasattr(seq_cls_model, "score"):
+        return seq_cls_model.score
+    if hasattr(seq_cls_model, "classifier"):
+        return seq_cls_model.classifier
     raise ValueError("Reward model has no known sequence-classification head ('score'/'classifier').")
 
 
@@ -74,13 +108,28 @@ def reward_scores_from_batch(
     attention_mask: torch.Tensor,
     provided_last_non_pad_idx: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    outputs = rm_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        return_dict=True,
-    )
-    hidden = outputs.hidden_states[-1]
+    seq_cls_model = _unwrap_sequence_classifier_model(rm_model)
+    backbone = _backbone_model(seq_cls_model)
+
+    if backbone is not None:
+        # Lower-memory path: only request last_hidden_state from backbone.
+        outputs = backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = outputs.last_hidden_state
+    else:
+        # Fallback for tests/dummy models that expose only forward(..., output_hidden_states=True).
+        outputs = seq_cls_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1]
+
     indices = provided_last_non_pad_idx
     if indices is None:
         indices = last_non_pad_indices(attention_mask)
@@ -89,7 +138,7 @@ def reward_scores_from_batch(
     last_hidden = gather_last_token_hidden(hidden, indices)
 
     # We explicitly score the last non-pad token for right-padded batches.
-    head = _classification_head(rm_model)
+    head = _classification_head(seq_cls_model)
     scores = head(last_hidden)
     if scores.ndim == 2 and scores.shape[1] == 1:
         scores = scores[:, 0]
@@ -109,6 +158,8 @@ def load_reward_model(
     )
 
     model.config.pad_token_id = rm_tokenizer.pad_token_id
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
 
     mode = config.rm_train.adaptation_mode.lower().strip()
     if mode == "lora":
@@ -127,5 +178,11 @@ def load_reward_model(
             f"Unsupported RM adaptation_mode '{config.rm_train.adaptation_mode}'. "
             "Use 'lora' or 'head_only'."
         )
+
+    if config.model.use_gradient_checkpointing:
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
 
     return model
