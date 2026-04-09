@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from config import RMConfig
@@ -144,7 +145,8 @@ def train_reward_model(
     metrics: dict = {}
 
     for epoch in range(cfg.epochs):
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"[RM] Epoch {epoch+1}/{cfg.epochs}", total=len(train_loader))
+        for batch in pbar:
             chosen_ids = batch["chosen_input_ids"].to(device)
             chosen_mask = batch["chosen_attention_mask"].to(device)
             rejected_ids = batch["rejected_input_ids"].to(device)
@@ -164,16 +166,20 @@ def train_reward_model(
             running_acc += acc.item()
             global_step += 1
 
+            # Update progress bar
+            pbar.set_postfix(loss=loss.item(), acc=acc.item(), lr=f"{scheduler.get_last_lr()[0]:.2e}")
+
             if global_step % cfg.log_every == 0:
                 avg_loss = running_loss / cfg.log_every
                 avg_acc = running_acc / cfg.log_every
-                print(
+                tqdm.write(
                     f"  [RM] step {global_step}/{total_steps} | "
                     f"loss={avg_loss:.4f} | acc={avg_acc:.4f} | "
                     f"lr={scheduler.get_last_lr()[0]:.2e}"
                 )
                 running_loss = 0.0
                 running_acc = 0.0
+        pbar.close()
 
     # --- Final train metrics ---
     metrics["train_loss"] = loss.item()  # last batch
@@ -226,7 +232,7 @@ def evaluate_rm(
     all_r_chosen = []
     all_r_rejected = []
 
-    for batch in eval_loader:
+    for batch in tqdm(eval_loader, desc="[RM] Evaluating"):
         chosen_ids = batch["chosen_input_ids"].to(device)
         chosen_mask = batch["chosen_attention_mask"].to(device)
         rejected_ids = batch["rejected_input_ids"].to(device)
