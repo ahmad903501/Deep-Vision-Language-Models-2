@@ -1,19 +1,42 @@
 from peft import LoraConfig, TaskType, get_peft_model
 
 
-def make_lora_config(rank: int, alpha: int, dropout: float, target_modules: list[str]) -> LoraConfig:
+def _resolve_task_type(task_type: str) -> TaskType:
+    mapping = {
+        "CAUSAL_LM": TaskType.CAUSAL_LM,
+        "SEQ_CLS": TaskType.SEQ_CLS,
+    }
+    if task_type not in mapping:
+        raise ValueError(f"Unsupported LoRA task type '{task_type}'.")
+    return mapping[task_type]
+
+
+def make_lora_config(
+    rank: int,
+    alpha: int,
+    dropout: float,
+    target_modules: list[str],
+    task_type: str = "CAUSAL_LM",
+) -> LoraConfig:
     return LoraConfig(
         r=rank,
         lora_alpha=alpha,
         lora_dropout=dropout,
         target_modules=target_modules,
-        task_type=TaskType.CAUSAL_LM,
+        task_type=_resolve_task_type(task_type),
         bias="none",
     )
 
 
-def apply_lora(model, rank: int, alpha: int, dropout: float, target_modules: list[str]):
-    config = make_lora_config(rank, alpha, dropout, target_modules)
+def apply_lora(
+    model,
+    rank: int,
+    alpha: int,
+    dropout: float,
+    target_modules: list[str],
+    task_type: str = "CAUSAL_LM",
+):
+    config = make_lora_config(rank, alpha, dropout, target_modules, task_type=task_type)
     lora_model = get_peft_model(model, config)
     return lora_model
 

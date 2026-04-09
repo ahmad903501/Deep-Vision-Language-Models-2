@@ -32,8 +32,33 @@ class DataConfig:
 
 
 @dataclass
+class RMTrainConfig:
+    epochs: int = 1
+    learning_rate: float = 1e-5
+    weight_decay: float = 0.0
+    lambda_reg: float = 1e-3
+    max_grad_norm: float = 1.0
+    log_every: int = 20
+    # Options: "lora" (LoRA on RM backbone) or "head_only" (train classifier head only).
+    adaptation_mode: str = "lora"
+
+
+@dataclass
+class SFTTrainConfig:
+    epochs: int = 1
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.0
+    grad_accum_steps: int = 4
+    max_grad_norm: float = 1.0
+    eval_every_steps: int = 100
+    sample_gen_max_new_tokens: int = 128
+
+
+@dataclass
 class ExperimentConfig:
     seed: int = 42
     model: ModelConfig = field(default_factory=ModelConfig)
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    rm_train: RMTrainConfig = field(default_factory=RMTrainConfig)
+    sft_train: SFTTrainConfig = field(default_factory=SFTTrainConfig)
