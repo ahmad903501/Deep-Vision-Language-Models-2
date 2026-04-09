@@ -47,10 +47,9 @@ def load_policy_model(
 
     model = AutoModelForCausalLM.from_pretrained(
         model_cfg.policy_model_name,
-        torch_dtype=dtype,
+        dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
-        resume_download=True,
     )
     if bnb is None:
         model = model.to(model_cfg.device)
@@ -81,10 +80,9 @@ def load_rm_backbone(
     model = AutoModelForSequenceClassification.from_pretrained(
         model_cfg.rm_model_name,
         num_labels=num_labels,
-        torch_dtype=dtype,
+        dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
-        resume_download=True,
     )
     if bnb is None:
         model = model.to(model_cfg.device)

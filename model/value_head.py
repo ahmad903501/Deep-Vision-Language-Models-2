@@ -61,10 +61,9 @@ def load_value_model(
 
     backbone = AutoModel.from_pretrained(
         model_cfg.value_model_name,
-        torch_dtype=dtype,
+        dtype=dtype,
         quantization_config=bnb,
         device_map="auto" if bnb else None,
-        resume_download=True,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.value_model_name)
