@@ -48,9 +48,35 @@ def _unwrap_sequence_classifier_model(model):
 
 
 def _backbone_model(seq_cls_model):
-    if hasattr(seq_cls_model, "model"):
-        return seq_cls_model.model
+    candidate = getattr(seq_cls_model, "model", None)
+    for _ in range(6):
+        if candidate is None:
+            return None
+
+        # Keep unwrapping if we are still at a sequence-classification wrapper.
+        if hasattr(candidate, "score") or hasattr(candidate, "classifier"):
+            candidate = getattr(candidate, "model", None)
+            continue
+
+        return candidate
+
     return None
+
+
+def _extract_last_hidden(outputs) -> torch.Tensor:
+    if hasattr(outputs, "last_hidden_state") and outputs.last_hidden_state is not None:
+        return outputs.last_hidden_state
+
+    if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+        if len(outputs.hidden_states) > 0:
+            return outputs.hidden_states[-1]
+
+    if isinstance(outputs, tuple) and len(outputs) > 0:
+        first = outputs[0]
+        if torch.is_tensor(first) and first.ndim == 3:
+            return first
+
+    raise ValueError("Unable to extract last hidden state from model outputs.")
 
 
 def _classification_head(model):
@@ -119,7 +145,7 @@ def reward_scores_from_batch(
             use_cache=False,
             return_dict=True,
         )
-        hidden = outputs.last_hidden_state
+        hidden = _extract_last_hidden(outputs)
     else:
         # Fallback for tests/dummy models that expose only forward(..., output_hidden_states=True).
         outputs = seq_cls_model(
@@ -128,7 +154,7 @@ def reward_scores_from_batch(
             output_hidden_states=True,
             return_dict=True,
         )
-        hidden = outputs.hidden_states[-1]
+        hidden = _extract_last_hidden(outputs)
 
     indices = provided_last_non_pad_idx
     if indices is None:
