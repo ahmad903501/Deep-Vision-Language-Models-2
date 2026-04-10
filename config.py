@@ -78,7 +78,7 @@ class RMConfig:
     lambda_reg: float = 1e-3
     log_every: int = 10
     target_accuracy: float = 0.60
-    max_train_samples: Optional[int] = 4000  # Head-only: 2k params, 4k examples is plenty
+    max_train_samples: Optional[int] = 8000  # Head-only: 2k params → 1000 steps is plenty
 
 
 # ---------------------------------------------------------------------------

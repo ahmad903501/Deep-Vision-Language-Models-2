@@ -113,7 +113,7 @@ def train_sft(
                     tqdm.write(
                         f"  [SFT] step {global_step}/{total_steps} | "
                         f"loss={avg_loss:.4f} | "
-                        f"ppl={math.exp(min(avg_loss * cfg.grad_accum_steps, 100)):.2f} | "
+                        f"ppl={math.exp(min(avg_loss, 100)):.2f} | "
                         f"lr={scheduler.get_last_lr()[0]:.2e}"
                     )
                     running_loss = 0.0

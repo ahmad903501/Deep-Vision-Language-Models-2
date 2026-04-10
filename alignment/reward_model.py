@@ -158,12 +158,15 @@ def train_reward_model(
         weight_decay=cfg.weight_decay,
     )
 
-    # --- Linear warmup scheduler ---
+    # --- Cosine scheduler with linear warmup ---
+    import math as _math
     total_steps = len(train_loader) * cfg.epochs
+
     def lr_lambda(current_step: int) -> float:
         if current_step < cfg.warmup_steps:
             return current_step / max(1, cfg.warmup_steps)
-        return 1.0
+        progress = (current_step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
+        return 0.5 * (1.0 + _math.cos(_math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
