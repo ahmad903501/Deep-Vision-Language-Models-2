@@ -113,8 +113,8 @@ class PPOConfig:
 @dataclass
 class DPOConfig:
     epochs: int = 1
-    batch_size: int = 8
-    grad_accum_steps: int = 4
+    batch_size: int = 2
+    grad_accum_steps: int = 16
     beta: float = 0.1
     lr: float = 1e-5
     weight_decay: float = 0.01
