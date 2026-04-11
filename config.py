@@ -59,7 +59,7 @@ class SFTConfig:
     grad_accum_steps: int = 4
     lr: float = 2e-5
     weight_decay: float = 0.01
-    warmup_steps: int = 100
+    warmup_steps: int = 50
     log_every: int = 10
     eval_every: int = 100
     max_train_samples: Optional[int] = 16000  # None = use all
