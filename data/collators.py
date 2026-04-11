@@ -143,6 +143,29 @@ class PolicyCollator:
             "rejected_response_start": torch.tensor(rejected_starts, dtype=torch.long),
         }
 
+    # -- GSM8K batches (for RLVR) ---------------------------------------------
+
+    def collate_gsm8k(self, batch: list[dict]) -> dict:
+        """Collate GSM8K examples for RLVR rollout.
+
+        Each item has keys: prompt, gold_answer.
+        Returns input_ids, attention_mask, gold_answers (list[float]).
+        """
+        self.tokenizer.padding_side = "left"
+        prompts = [ex["prompt"] for ex in batch]
+        encoded = self.tokenizer(
+            prompts,
+            padding="longest",
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        return {
+            "input_ids": encoded["input_ids"],
+            "attention_mask": encoded["attention_mask"],
+            "gold_answers": [ex["gold_answer"] for ex in batch],
+        }
+
 
 class RMCollator:
     """Collator for reward model training/inference.
