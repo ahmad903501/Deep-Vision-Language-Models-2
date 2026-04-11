@@ -33,14 +33,18 @@ class PolicyCollator:
 
     # -- SFT batches ----------------------------------------------------------
 
+    # -- SFT batches ----------------------------------------------------------
+
     def collate_sft(self, batch: list[dict]) -> dict:
-        """Collate SFT examples (prompt + chosen response).
+        """Collate SFT examples (prompt + chosen response + EOS).
 
         Returns:
-            input_ids, attention_mask, labels  (prompt tokens masked with -100)
+            input_ids, attention_mask, labels (prompt tokens masked with -100)
         """
-        self.tokenizer.padding_side = "left"
-        full_texts = [ex["prompt"] + " " + ex["response"] for ex in batch]
+        self.tokenizer.padding_side = "left"  # Required for decoder-only generation [cite: 259]
+        
+        # We append the eos_token here so the model learns to terminate generation.
+        full_texts = [ex["prompt"] + " " + ex["response"] + self.tokenizer.eos_token for ex in batch]
         prompts = [ex["prompt"] for ex in batch]
 
         encoded = self.tokenizer(
@@ -50,6 +54,8 @@ class PolicyCollator:
             max_length=self.max_length,
             return_tensors="pt",
         )
+        
+        # We tokenize prompts separately to find the length for masking [cite: 305, 306]
         prompt_encoded = self.tokenizer(
             prompts,
             padding=False,
@@ -60,14 +66,17 @@ class PolicyCollator:
 
         labels = encoded["input_ids"].clone()
         for i, plen in enumerate(len(ids) for ids in prompt_encoded["input_ids"]):
-            # With left-padding, the prompt starts after the padding.
-            # Number of pad tokens = max_len - total_len for this example.
+            # For left-padding, the actual content starts after the padding tokens.
+            # total_len = number of non-pad tokens in this specific sequence
             total_len = encoded["attention_mask"][i].sum().item()
+            # pad_len = number of leading [PAD] tokens in the batch tensor
             pad_len = encoded["input_ids"].size(1) - total_len
-            # Mask everything from start through pad + prompt tokens
+            
+            # CRITICAL: Mask everything from the start through the padding and the prompt tokens.
+            # Only the response and the appended EOS token remain unmasked for loss calculation[cite: 305, 306].
             labels[i, : pad_len + plen] = -100
 
-        # Also mask padding tokens
+        # Also ensure explicit padding tokens are masked to prevent gradient interference
         labels[encoded["attention_mask"] == 0] = -100
 
         return {
