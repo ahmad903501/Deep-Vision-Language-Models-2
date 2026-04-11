@@ -62,7 +62,7 @@ class SFTConfig:
     warmup_steps: int = 50
     log_every: int = 10
     eval_every: int = 100
-    max_train_samples: Optional[int] = 16000  # None = use all
+    max_train_samples: Optional[int] = 4800  # None = use all
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ class DPOConfig:
     eval_every: int = 25
     eval_prompts: int = 200
     log_every: int = 1
-    max_train_samples: Optional[int] = None
+    max_train_samples: Optional[int] = 6400
 
 
 # ---------------------------------------------------------------------------

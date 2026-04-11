@@ -91,6 +91,26 @@ def group_rollout(
 
     # 3. RM scores
     texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=True)
+    # --- DEBUG PROBE START ---
+    if full_ids.numel() == 0:
+        print("🚨 ERROR: full_ids is empty before decoding!")
+    
+    # Let's see what the first few IDs actually are
+    print(f"DEBUG: full_ids shape: {full_ids.shape}")
+    print(f"DEBUG: Sample IDs from first row: {full_ids[0, :10].tolist()}")
+
+    # Try decoding WITH special tokens first to see if anything exists
+    raw_texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=False)
+    print(f"DEBUG: Raw text (with special tokens) sample: '{raw_texts[0][:50]}...' ")
+
+    # Now the original line
+    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=True)
+    
+    if any(len(t.strip()) == 0 for t in texts):
+        print("🚨 ERROR: batch_decode returned empty strings!")
+        # Safety fallback to prevent the crash
+        texts = [t if len(t.strip()) > 0 else "Safety Fallback" for t in texts]
+    # --- DEBUG PROBE END ---
     rewards = score_with_rm(rm_model, rm_tokenizer, texts, device=device).to(device)  # (B*K,)
 
     # 4. Group-relative advantages: normalize within each group of K
