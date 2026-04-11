@@ -90,14 +90,20 @@ def dpo_loss(
     c_start = batch["chosen_response_start"]
     r_start = batch["rejected_response_start"]
 
-    # Policy log-probs
-    pi_logp_chosen = sequence_log_prob(policy, c_ids, c_mask, c_start)
-    pi_logp_rejected = sequence_log_prob(policy, r_ids, r_mask, r_start)
+    # Fuse chosen+rejected into one forward pass per model to halve peak VRAM
+    cat_ids = torch.cat([c_ids, r_ids], dim=0)        # (2B, L)
+    cat_mask = torch.cat([c_mask, r_mask], dim=0)      # (2B, L)
+    cat_start = torch.cat([c_start, r_start], dim=0)   # (2B,)
+    B = c_ids.shape[0]
 
-    # Reference log-probs (no gradients)
+    # Policy log-probs (single forward pass, keeps grad graph)
+    pi_logp = sequence_log_prob(policy, cat_ids, cat_mask, cat_start)
+    pi_logp_chosen, pi_logp_rejected = pi_logp[:B], pi_logp[B:]
+
+    # Reference log-probs (single forward pass, no gradients)
     with torch.no_grad():
-        ref_logp_chosen = sequence_log_prob(ref_model, c_ids, c_mask, c_start)
-        ref_logp_rejected = sequence_log_prob(ref_model, r_ids, r_mask, r_start)
+        ref_logp = sequence_log_prob(ref_model, cat_ids, cat_mask, cat_start)
+        ref_logp_chosen, ref_logp_rejected = ref_logp[:B], ref_logp[B:]
 
     # DPO implicit reward margin:
     #   z = β * ( (log π_θ(y+|x) - log π_θ(y-|x)) - (log π_ref(y+|x) - log π_ref(y-|x)) )
