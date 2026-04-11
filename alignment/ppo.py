@@ -99,6 +99,8 @@ def rollout(
         temperature=cfg.temperature,
         top_p=cfg.top_p,
         pad_token_id=policy_tokenizer.pad_token_id,
+        # If your model continues to hallucinate turns, uncomment the line below:
+        # stop_strings=["Human:", "###"], tokenizer=policy_tokenizer 
     )
     response_ids = gen_out["response_ids"]       # (B, T)
     old_logprobs = gen_out["logprobs"]           # (B, T)
@@ -117,8 +119,14 @@ def rollout(
     all_values = value_model(full_ids, full_mask)     # (B, P+T)
     values = all_values[:, prompt_len:]               # (B, T)
 
-    # 5. Sequence-level RM score
-    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=True)
+    # 5. Sequence-level RM score (Safe-Decode Implementation)
+    # Using skip_special_tokens=False ensures the Reward Model receives 
+    # the structural context and prevents zero-length tensor crashes.
+    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=False)
+    
+    # Safety fallback: ensure no string is empty or purely whitespace
+    texts = [t if (t and len(t.strip()) > 0) else "Invalid empty response" for t in texts]
+
     rewards = score_with_rm(
         rm_model, rm_tokenizer, texts, device=device
     ).to(device)
@@ -146,19 +154,7 @@ def compute_gae(
     gamma: float = 1.0,
     lam: float = 0.95,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute GAE advantages and λ-returns.
-
-    Args:
-        rewards_per_token: per-token shaped rewards
-        values: V_old(s_t)
-        response_mask: 1 for valid response tokens
-        gamma: discount factor (1.0 = no discounting)
-        lam: GAE λ
-
-    Returns:
-        advantages: (B, T) — raw (un-normalized; caller normalizes)
-        returns:    (B, T) — V^GAE targets (detached)
-    """
+    """Compute GAE advantages and λ-returns."""
     B, T = rewards_per_token.shape
     advantages = torch.zeros_like(rewards_per_token)
     last_gae = torch.zeros(B, device=rewards_per_token.device)
@@ -192,10 +188,7 @@ def ppo_step(
     returns: torch.Tensor,
     cfg: PPOConfig,
 ) -> dict:
-    """Run one PPO update (multiple mini-batch epochs over the rollout).
-
-    Returns dict with: policy_loss, value_loss, kl, clip_frac, grad_norm.
-    """
+    """Run one PPO update (multiple mini-batch epochs over the rollout)."""
     mask = batch.response_mask
     n_valid = mask.sum().clamp(min=1)
     prompt_len = batch.prompt_ids.shape[1]
@@ -269,7 +262,7 @@ def ppo_step(
         nn.utils.clip_grad_norm_(value_model.parameters(), max_norm=cfg.max_grad_norm)
         value_optimizer.step()
 
-        # Accumulate
+        # Accumulate metrics
         totals["policy_loss"] += clip_loss.item()
         totals["value_loss"] += value_loss.item()
         totals["kl"] += approx_kl.item()

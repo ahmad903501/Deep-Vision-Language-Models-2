@@ -1,7 +1,7 @@
 """
 Group Relative Policy Optimization (GRPO).
 
-Critic-free online alignment.  For each prompt, sample K completions,
+Critic-free online alignment. For each prompt, sample K completions,
 compute group-relative advantages, and apply clipped surrogate (eq. 12).
 """
 from __future__ import annotations
@@ -24,14 +24,14 @@ from alignment.reward_model import score_with_rm
 @dataclass
 class GroupRollout:
     """Stores data from a GRPO group rollout."""
-    prompt_ids: torch.Tensor            # (B*K, P)
-    prompt_mask: torch.Tensor           # (B*K, P)
-    response_ids: torch.Tensor          # (B*K, T)
-    old_logprobs: torch.Tensor          # (B*K, T)
-    ref_logprobs: torch.Tensor          # (B*K, T)
-    rewards: torch.Tensor               # (B*K,)
-    advantages: torch.Tensor            # (B*K,)  — group-relative, broadcast to tokens
-    response_mask: torch.Tensor         # (B*K, T)
+    prompt_ids: torch.Tensor             # (B*K, P)
+    prompt_mask: torch.Tensor            # (B*K, P)
+    response_ids: torch.Tensor           # (B*K, T)
+    old_logprobs: torch.Tensor           # (B*K, T)
+    ref_logprobs: torch.Tensor           # (B*K, T)
+    rewards: torch.Tensor                # (B*K,)
+    advantages: torch.Tensor             # (B*K,)  — group-relative, broadcast to tokens
+    response_mask: torch.Tensor          # (B*K, T)
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +53,6 @@ def group_rollout(
 
     For B prompts, generates B*K responses. Each group of K shares the same prompt.
     Advantages are normalized within each group (mean=0, std=1).
-
-    Returns GroupRollout with all data needed for grpo_step.
     """
     policy.eval()
     ref_model.eval()
@@ -89,35 +87,23 @@ def group_rollout(
     full_mask = torch.cat([attn_mask_rep, response_mask], dim=1)
     ref_logprobs = get_per_token_logprobs(ref_model, full_ids, full_mask, P)
 
-    # 3. RM scores
-    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=True)
-    # --- DEBUG PROBE START ---
-    if full_ids.numel() == 0:
-        print("🚨 ERROR: full_ids is empty before decoding!")
+    # 3. RM scores (Safe-Decode Implementation)
+    # CRITICAL: We use skip_special_tokens=False because the RM needs the context,
+    # and it prevents the crash caused by empty strings if the model only outputs special tokens.
+    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=False)
     
-    # Let's see what the first few IDs actually are
-    print(f"DEBUG: full_ids shape: {full_ids.shape}")
-    print(f"DEBUG: Sample IDs from first row: {full_ids[0, :10].tolist()}")
-
-    # Try decoding WITH special tokens first to see if anything exists
-    raw_texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=False)
-    print(f"DEBUG: Raw text (with special tokens) sample: '{raw_texts[0][:50]}...' ")
-
-    # Now the original line
-    texts = policy_tokenizer.batch_decode(full_ids, skip_special_tokens=True)
+    # Safety fallback: ensure no string is empty or purely whitespace
+    texts = [t if (t and len(t.strip()) > 0) else "Invalid empty response" for t in texts]
     
-    if any(len(t.strip()) == 0 for t in texts):
-        print("🚨 ERROR: batch_decode returned empty strings!")
-        # Safety fallback to prevent the crash
-        texts = [t if len(t.strip()) > 0 else "Safety Fallback" for t in texts]
-    # --- DEBUG PROBE END ---
     rewards = score_with_rm(rm_model, rm_tokenizer, texts, device=device).to(device)  # (B*K,)
 
-    # 4. Group-relative advantages: normalize within each group of K
+    # 4. Group-relative advantages
     rewards_grouped = rewards.view(B, K)                   # (B, K)
     group_mean = rewards_grouped.mean(dim=1, keepdim=True) # (B, 1)
     group_std = rewards_grouped.std(dim=1, keepdim=True)   # (B, 1)
-    advantages_grouped = (rewards_grouped - group_mean) / (group_std + 1e-8)  # (B, K)
+    
+    # Use 1e-4 for numerical stability in case all rewards in a group are identical
+    advantages_grouped = (rewards_grouped - group_mean) / (group_std + 1e-4)  # (B, K)
     advantages = advantages_grouped.view(B * K)            # (B*K,)
 
     return GroupRollout(
@@ -143,13 +129,7 @@ def grpo_step(
     group_data: GroupRollout,
     cfg: GRPOConfig,
 ) -> dict:
-    """One GRPO gradient step (Eq. 12).
-
-    Clipped surrogate with group-relative advantages + KL penalty.
-    No value model, no PPO epochs — single pass.
-
-    Returns dict: {loss, kl, clip_frac, degenerate_frac, grad_norm}.
-    """
+    """One GRPO gradient step (Eq. 12)."""
     policy.train()
     optimizer.zero_grad()
 
