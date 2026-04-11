@@ -91,6 +91,19 @@ def dpo_loss(
     r_start = batch["rejected_response_start"]
 
     # Fuse chosen+rejected into one forward pass per model to halve peak VRAM
+    # Pad to same length if chosen/rejected were padded independently
+    max_len = max(c_ids.shape[1], r_ids.shape[1])
+    if c_ids.shape[1] < max_len:
+        pad_len = max_len - c_ids.shape[1]
+        c_ids = F.pad(c_ids, (pad_len, 0), value=0)       # left-pad
+        c_mask = F.pad(c_mask, (pad_len, 0), value=0)
+        c_start = c_start + pad_len
+    elif r_ids.shape[1] < max_len:
+        pad_len = max_len - r_ids.shape[1]
+        r_ids = F.pad(r_ids, (pad_len, 0), value=0)       # left-pad
+        r_mask = F.pad(r_mask, (pad_len, 0), value=0)
+        r_start = r_start + pad_len
+
     cat_ids = torch.cat([c_ids, r_ids], dim=0)        # (2B, L)
     cat_mask = torch.cat([c_mask, r_mask], dim=0)      # (2B, L)
     cat_start = torch.cat([c_start, r_start], dim=0)   # (2B,)
