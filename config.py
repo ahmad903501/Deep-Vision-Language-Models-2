@@ -131,7 +131,7 @@ class DPOConfig:
 @dataclass
 class GRPOConfig:
     num_steps: int = 200
-    prompts_per_step: int = 8
+    prompts_per_step: int = 4
     K: int = 4                 # completions per prompt
     beta: float = 0.1
     epsilon: float = 0.2
@@ -152,7 +152,7 @@ class GRPOConfig:
 @dataclass
 class RLVRConfig:
     num_steps: int = 300
-    prompts_per_step: int = 8
+    prompts_per_step: int = 4
     K: int = 4
     beta: float = 0.05
     epsilon: float = 0.2
