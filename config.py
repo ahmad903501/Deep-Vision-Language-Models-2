@@ -96,6 +96,7 @@ class PPOConfig:
     lr_policy: float = 1e-5
     lr_value: float = 1e-5
     max_grad_norm: float = 1.0
+    max_new_tokens: int = 128  # max response length during rollout
     temperature: float = 0.7
     top_p: float = 0.9
     value_loss_coef: float = 0.5

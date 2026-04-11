@@ -32,7 +32,32 @@ def generate_with_logprobs(
         logprobs:       (B, T) log π(y_t | s_t) for each response token
         response_mask:  (B, T) 1 where token is real, 0 for padding
     """
-    raise NotImplementedError("Implement in Phase 5")
+    prompt_len = input_ids.shape[1]
+
+    # 1. Generate responses via sampling
+    output_ids = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=pad_token_id,
+    )  # (B, P+T')
+
+    # 2. Extract response portion
+    response_ids = output_ids[:, prompt_len:]      # (B, T')
+    response_mask = (response_ids != pad_token_id).long()
+
+    # 3. Build full attention mask and get per-token log-probs
+    full_mask = torch.cat([attention_mask, response_mask], dim=1)
+    logprobs = get_per_token_logprobs(model, output_ids, full_mask, prompt_len)
+
+    return {
+        "response_ids": response_ids,
+        "logprobs": logprobs,
+        "response_mask": response_mask,
+    }
 
 
 @torch.no_grad()
@@ -52,4 +77,21 @@ def get_per_token_logprobs(
 
     Returns: (B, T) log-probabilities for response tokens only
     """
-    raise NotImplementedError("Implement in Phase 5")
+    outputs = model(input_ids=full_ids, attention_mask=attention_mask)
+    logits = outputs.logits  # (B, L, V)
+
+    # Shift: logits at position t predict token at position t+1.
+    # For response starting at index `response_start`, the logit at
+    # position response_start-1 predicts token response_start, etc.
+    if isinstance(response_start, int):
+        shift_logits = logits[:, response_start - 1 : -1, :]  # (B, T, V)
+        target_ids = full_ids[:, response_start:]              # (B, T)
+    else:
+        raise ValueError("Per-sequence response_start not yet supported")
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)  # (B, T, V)
+    token_logprobs = log_probs.gather(
+        2, target_ids.unsqueeze(-1)
+    ).squeeze(-1)  # (B, T)
+
+    return token_logprobs
