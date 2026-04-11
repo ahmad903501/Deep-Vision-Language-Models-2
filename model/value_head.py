@@ -1,5 +1,5 @@
 """
-Value model for PPO: Llama-3.2-1B backbone + scalar head.
+Value model for PPO: backbone + scalar head.
 
 The value backbone is architecturally separate from the policy to avoid
 gradient interference.  The scalar head is a single nn.Linear(d_model, 1)
@@ -16,7 +16,7 @@ from model.loader import _get_bnb_config, apply_lora
 
 
 class ValueModel(nn.Module):
-    """Llama backbone + linear scalar head for PPO critic."""
+    """Backbone + linear scalar head for PPO critic."""
 
     def __init__(self, backbone, hidden_size: int):
         super().__init__()
@@ -47,7 +47,7 @@ def load_value_model(
     lora_cfg: LoRAConfig | None = None,
     freeze_backbone: bool = False,
 ) -> tuple:
-    """Load a ValueModel from the Llama backbone.
+    """Load a ValueModel from the backbone.
 
     Args:
         model_cfg: Model configuration.

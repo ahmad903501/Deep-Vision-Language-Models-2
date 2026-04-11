@@ -69,7 +69,7 @@ def load_rm_backbone(
     model_cfg: ModelConfig,
     num_labels: int = 1,
 ) -> tuple:
-    """Load Llama-3.2-1B-Instruct as a sequence classifier + tokenizer.
+    """Load the RM backbone as a sequence classifier + tokenizer.
 
     Used for both the reward model (Task C1) and value model backbone (Task C3).
     The scalar head is the classification layer (d_model → 1).

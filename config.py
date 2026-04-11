@@ -12,8 +12,8 @@ from typing import Literal, Optional
 @dataclass
 class ModelConfig:
     policy_model_name: str = "HuggingFaceTB/SmolLM2-360M"
-    rm_model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
-    value_model_name: str = "meta-llama/Llama-3.2-1B-Instruct"
+    rm_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
+    value_model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     torch_dtype: str = "bfloat16"
     load_in_8bit: bool = False
     load_in_4bit: bool = False

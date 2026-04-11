@@ -1,7 +1,7 @@
 """
 Reward model training and scoring.
 
-Architecture: AutoModelForSequenceClassification (Llama-3.2-1B backbone).
+Architecture: AutoModelForSequenceClassification backbone.
 Loss: Bradley-Terry margin ranking + L2 regularization on reward magnitudes.
 Scalar extraction: AutoModelForSequenceClassification pools internally at the
 last non-pad token when config.pad_token_id is set.  We also provide a standalone
@@ -80,7 +80,7 @@ def get_rm_scores_headonly(
     """
     # 1) Forward through frozen backbone — no graph needed
     with torch.no_grad():
-        backbone = rm_model.model  # LlamaModel inside AutoModelForSequenceClassification
+        backbone = rm_model.model  # backbone inside AutoModelForSequenceClassification
         transformer_outputs = backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
