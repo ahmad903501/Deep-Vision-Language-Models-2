@@ -11,7 +11,7 @@ from typing import Literal, Optional
 # ---------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    policy_model_name: str = "HuggingFaceTB/SmolLM2-360M"
+    policy_model_name: str = "/kaggle/input/models/ahmadjawwad903/smollm2-360-latest/transformers/default/1"
     rm_model_name: str = "/kaggle/input/models/qwen-lm/qwen2.5/transformers/0.5b-instruct/1"
     value_model_name: str = "/kaggle/input/models/qwen-lm/qwen2.5/transformers/0.5b-instruct/1"
     torch_dtype: str = "bfloat16"
