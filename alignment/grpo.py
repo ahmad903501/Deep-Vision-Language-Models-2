@@ -128,68 +128,91 @@ def grpo_step(
     optimizer: torch.optim.Optimizer,
     group_data: GroupRollout,
     cfg: GRPOConfig,
+    mbs: int = 4,
 ) -> dict:
-    """One GRPO gradient step (Eq. 12)."""
+    """One GRPO gradient step (Eq. 12) with mini-batch gradient accumulation."""
     policy.train()
     optimizer.zero_grad()
 
     mask = group_data.response_mask
     n_valid = mask.sum().clamp(min=1)
     P = group_data.prompt_ids.shape[1]
+    BK = group_data.prompt_ids.shape[0]  # B*K total sequences
 
-    # Full sequence for forward pass
-    full_ids = torch.cat([group_data.prompt_ids, group_data.response_ids], dim=1)
-    full_mask = torch.cat([group_data.prompt_mask, group_data.response_mask], dim=1)
+    # Tracking accumulators
+    total_loss = 0.0
+    total_kl = 0.0
+    total_clip = 0.0
+    all_ratios = []
 
-    # Current policy log-probs
-    outputs = policy(input_ids=full_ids, attention_mask=full_mask)
-    logits = outputs.logits[:, P - 1 : -1, :]   # (B*K, T, V)
+    n_minibatches = max(1, (BK + mbs - 1) // mbs)
 
-    log_probs = F.log_softmax(logits, dim=-1)
-    current_logprobs = log_probs.gather(
-        2, group_data.response_ids.unsqueeze(-1)
-    ).squeeze(-1)                                 # (B*K, T)
+    for i in range(0, BK, mbs):
+        # Slice mini-batch
+        m_prompt = group_data.prompt_ids[i:i+mbs]
+        m_prompt_mask = group_data.prompt_mask[i:i+mbs]
+        m_resp = group_data.response_ids[i:i+mbs]
+        m_resp_mask = group_data.response_mask[i:i+mbs]
+        m_old_lp = group_data.old_logprobs[i:i+mbs]
+        m_ref_lp = group_data.ref_logprobs[i:i+mbs]
+        m_adv = group_data.advantages[i:i+mbs]
 
-    # Importance-sampling ratio
-    ratio = torch.exp(current_logprobs - group_data.old_logprobs.detach())
+        m_full_ids = torch.cat([m_prompt, m_resp], dim=1)
+        m_full_mask = torch.cat([m_prompt_mask, m_resp_mask], dim=1)
+        m_valid = m_resp_mask.sum().clamp(min=1)
 
-    # Broadcast per-sequence advantage to per-token
-    adv = group_data.advantages.detach().unsqueeze(1) * mask   # (B*K, T)
+        # Current policy log-probs
+        outputs = policy(input_ids=m_full_ids, attention_mask=m_full_mask)
+        logits = outputs.logits[:, P - 1 : -1, :]
 
-    # Clipped surrogate (Eq. 12)
-    unclipped = ratio * adv
-    clipped = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * adv
-    surrogate_loss = -torch.min(unclipped, clipped)
-    surrogate_loss = (surrogate_loss * mask).sum() / n_valid
+        log_probs = F.log_softmax(logits, dim=-1)
+        current_logprobs = log_probs.gather(
+            2, m_resp.unsqueeze(-1)
+        ).squeeze(-1)
 
-    # KL penalty (MC approximation: log π_θ - log π_ref)
-    kl_per_token = (current_logprobs - group_data.ref_logprobs.detach()) * mask
-    kl = kl_per_token.sum() / n_valid
+        # Importance-sampling ratio
+        ratio = torch.exp(current_logprobs - m_old_lp.detach())
 
-    # Combined loss
-    loss = surrogate_loss + cfg.beta * kl
-    loss.backward()
+        # Broadcast per-sequence advantage to per-token
+        adv = m_adv.detach().unsqueeze(1) * m_resp_mask
+
+        # Clipped surrogate (Eq. 12)
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * adv
+        surrogate_loss = -torch.min(unclipped, clipped)
+        surrogate_loss = (surrogate_loss * m_resp_mask).sum() / n_valid
+
+        # KL penalty (MC approximation: log π_θ - log π_ref)
+        kl_per_token = (current_logprobs - m_ref_lp.detach()) * m_resp_mask
+        kl = kl_per_token.sum() / n_valid
+
+        # Combined loss — no division by n_minibatches needed since we normalize by n_valid (full batch)
+        mb_loss = surrogate_loss + cfg.beta * kl
+        mb_loss.backward()
+
+        # Accumulate logging
+        total_loss += mb_loss.item()
+        total_kl += kl.item()
+        with torch.no_grad():
+            _clip = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
+            total_clip += (_clip * m_resp_mask).sum().item() / n_valid.item()
+
+    # Single optimizer step after all mini-batches
     grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_norm=cfg.max_grad_norm)
     optimizer.step()
 
-    # Monitoring metrics
+    # Degenerate fraction
     with torch.no_grad():
-        clip_frac = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
-        clip_frac = (clip_frac * mask).sum() / n_valid
-
-        # Degenerate fraction: groups where all K rewards are identical (std ≈ 0)
-        BK = group_data.rewards.shape[0]
         K = cfg.K
         B = BK // K
         rewards_grouped = group_data.rewards.view(B, K)
         degenerate_frac = (rewards_grouped.std(dim=1) < 1e-6).float().mean()
-
         gn = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
     return {
-        "loss": loss.item(),
-        "kl": kl.item(),
-        "clip_frac": clip_frac.item(),
+        "loss": total_loss,
+        "kl": total_kl,
+        "clip_frac": total_clip,
         "degenerate_frac": degenerate_frac.item(),
         "grad_norm": gn,
         "reward_mean": group_data.rewards.mean().item(),
