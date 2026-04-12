@@ -188,87 +188,68 @@ def ppo_step(
     returns: torch.Tensor,
     cfg: PPOConfig,
 ) -> dict:
-    """Run one PPO update (multiple mini-batch epochs over the rollout)."""
     mask = batch.response_mask
     n_valid = mask.sum().clamp(min=1)
     prompt_len = batch.prompt_ids.shape[1]
-
-    # Normalize advantages batch-wide
+    B = batch.prompt_ids.shape[0]
+    
+    # Normalize advantages
     valid_advs = advantages[mask.bool()]
     adv_mean = valid_advs.mean()
     adv_std = valid_advs.std()
     norm_adv = ((advantages - adv_mean) / (adv_std + 1e-8)) * mask
 
-    # Full sequence for forward passes
-    full_ids = torch.cat([batch.prompt_ids, batch.response_ids], dim=1)
-    full_mask = torch.cat([batch.prompt_mask, batch.response_mask], dim=1)
-
-    totals = {
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "kl": 0.0,
-        "clip_frac": 0.0,
-        "grad_norm": 0.0,
-    }
+    totals = {"policy_loss": 0.0, "value_loss": 0.0, "kl": 0.0, "clip_frac": 0.0, "grad_norm": 0.0}
+    
+    # CS Major Move: Use a small mini-batch size for the update
+    # Adjust this based on VRAM (2 is safe, 4 is faster)
+    mbs = 2 
 
     for _epoch in range(cfg.ppo_epochs):
-        # -------------------- Policy --------------------
-        policy.train()
-        policy_optimizer.zero_grad()
+        for i in range(0, B, mbs):
+            # Slice the batch
+            m_ids = torch.cat([batch.prompt_ids[i:i+mbs], batch.response_ids[i:i+mbs]], dim=1)
+            m_mask = torch.cat([batch.prompt_mask[i:i+mbs], batch.response_mask[i:i+mbs]], dim=1)
+            m_resp_mask = batch.response_mask[i:i+mbs]
+            m_old_logprobs = batch.old_logprobs[i:i+mbs]
+            m_norm_adv = norm_adv[i:i+mbs]
+            m_returns = returns[i:i+mbs]
+            m_resp_ids = batch.response_ids[i:i+mbs]
+            
+            m_valid_tokens = m_resp_mask.sum().clamp(min=1)
 
-        outputs = policy(input_ids=full_ids, attention_mask=full_mask)
-        logits = outputs.logits[:, prompt_len - 1 : -1, :]   # (B, T, V)
+            # -------------------- Policy --------------------
+            policy.train()
+            policy_optimizer.zero_grad()
+            logits = policy(input_ids=m_ids, attention_mask=m_mask).logits[:, prompt_len - 1 : -1, :]
+            
+            log_probs = F.log_softmax(logits, dim=-1)
+            current_logprobs = log_probs.gather(2, m_resp_ids.unsqueeze(-1)).squeeze(-1)
 
-        log_probs = F.log_softmax(logits, dim=-1)
-        current_logprobs = log_probs.gather(
-            2, batch.response_ids.unsqueeze(-1)
-        ).squeeze(-1)                                         # (B, T)
+            ratio = torch.exp(current_logprobs - m_old_logprobs.detach())
+            surr1 = ratio * m_norm_adv.detach()
+            surr2 = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * m_norm_adv.detach()
+            
+            approx_kl = (m_old_logprobs.detach() - current_logprobs)
+            policy_loss = -torch.min(surr1, surr2).sum() / m_valid_tokens
+            policy_loss += cfg.kl_coef * (approx_kl * m_resp_mask).sum() / m_valid_tokens
+            
+            policy_loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+            policy_optimizer.step()
 
-        # Entropy
-        probs = torch.exp(log_probs)
-        entropy_per_token = -(probs * log_probs).sum(dim=-1)
-        entropy = (entropy_per_token * mask).sum() / n_valid
+            # -------------------- Value --------------------
+            value_model.train()
+            value_optimizer.zero_grad()
+            current_values = value_model(m_ids, m_mask)[:, prompt_len:]
+            value_loss = ((current_values - m_returns.detach()) ** 2 * m_resp_mask).sum() / m_valid_tokens
+            (cfg.value_loss_coef * value_loss).backward()
+            nn.utils.clip_grad_norm_(value_model.parameters(), cfg.max_grad_norm)
+            value_optimizer.step()
 
-        # Importance-sampling ratio
-        ratio = torch.exp(current_logprobs - batch.old_logprobs.detach())
+            # Logging accumulation
+            totals["policy_loss"] += policy_loss.item() / (B/mbs)
+            totals["value_loss"] += value_loss.item() / (B/mbs)
+            totals["kl"] += (approx_kl * m_resp_mask).sum().item() / n_valid
 
-        # Clipped surrogate loss (Eq. 9)
-        unclipped = ratio * norm_adv.detach()
-        clipped = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * norm_adv.detach()
-        clip_loss = -torch.min(unclipped, clipped)
-        clip_loss = (clip_loss * mask).sum() / n_valid
-
-        # Approximate KL (monitoring + loss)
-        approx_kl = (batch.old_logprobs.detach() - current_logprobs)
-        approx_kl = (approx_kl * mask).sum() / n_valid
-
-        # Clip fraction (monitoring)
-        clip_frac = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
-        clip_frac = (clip_frac * mask).sum() / n_valid
-
-        # Combined policy loss
-        policy_loss = clip_loss - cfg.entropy_coef * entropy + cfg.kl_coef * approx_kl
-        policy_loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_norm=cfg.max_grad_norm)
-        policy_optimizer.step()
-
-        # -------------------- Value --------------------
-        value_model.train()
-        value_optimizer.zero_grad()
-
-        current_values = value_model(full_ids, full_mask)[:, prompt_len:]
-        value_loss = ((current_values - returns.detach()) ** 2 * mask).sum() / n_valid
-        (cfg.value_loss_coef * value_loss).backward()
-        nn.utils.clip_grad_norm_(value_model.parameters(), max_norm=cfg.max_grad_norm)
-        value_optimizer.step()
-
-        # Accumulate metrics
-        totals["policy_loss"] += clip_loss.item()
-        totals["value_loss"] += value_loss.item()
-        totals["kl"] += approx_kl.item()
-        totals["clip_frac"] += clip_frac.item()
-        gn = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-        totals["grad_norm"] += gn
-
-    n = cfg.ppo_epochs
-    return {k: v / n for k, v in totals.items()}
+    return {k: v / cfg.ppo_epochs for k, v in totals.items()}
