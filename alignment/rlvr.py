@@ -108,8 +108,9 @@ def rlvr_step(
     optimizer: torch.optim.Optimizer,
     group_data: GroupRollout,
     cfg: RLVRConfig,
+    mbs: int = 4,
 ) -> dict:
-    """One RLVR gradient step (reuses GRPO mechanics).
+    """One RLVR gradient step (reuses GRPO mechanics) with mini-batch accumulation.
 
     Returns dict: {loss, kl, clip_frac, pass_rate, degenerate_frac,
                    mean_length, grad_norm, reward_mean, reward_std}.
@@ -120,66 +121,79 @@ def rlvr_step(
     mask = group_data.response_mask
     n_valid = mask.sum().clamp(min=1)
     P = group_data.prompt_ids.shape[1]
+    BK = group_data.prompt_ids.shape[0]
 
-    # Full sequence for forward pass
-    full_ids = torch.cat([group_data.prompt_ids, group_data.response_ids], dim=1)
-    full_mask = torch.cat([group_data.prompt_mask, group_data.response_mask], dim=1)
+    total_loss = 0.0
+    total_kl = 0.0
+    total_clip = 0.0
 
-    # Current policy log-probs
-    outputs = policy(input_ids=full_ids, attention_mask=full_mask)
-    logits = outputs.logits[:, P - 1 : -1, :]   # (B*K, T, V)
+    for i in range(0, BK, mbs):
+        m_prompt = group_data.prompt_ids[i:i+mbs]
+        m_prompt_mask = group_data.prompt_mask[i:i+mbs]
+        m_resp = group_data.response_ids[i:i+mbs]
+        m_resp_mask = group_data.response_mask[i:i+mbs]
+        m_old_lp = group_data.old_logprobs[i:i+mbs]
+        m_ref_lp = group_data.ref_logprobs[i:i+mbs]
+        m_adv = group_data.advantages[i:i+mbs]
 
-    log_probs = F.log_softmax(logits, dim=-1)
-    current_logprobs = log_probs.gather(
-        2, group_data.response_ids.unsqueeze(-1)
-    ).squeeze(-1)                                 # (B*K, T)
+        m_full_ids = torch.cat([m_prompt, m_resp], dim=1)
+        m_full_mask = torch.cat([m_prompt_mask, m_resp_mask], dim=1)
 
-    # Importance-sampling ratio
-    ratio = torch.exp(current_logprobs - group_data.old_logprobs.detach())
+        # Current policy log-probs
+        outputs = policy(input_ids=m_full_ids, attention_mask=m_full_mask)
+        logits = outputs.logits[:, P - 1 : -1, :]
 
-    # Broadcast per-sequence advantage to per-token
-    adv = group_data.advantages.detach().unsqueeze(1) * mask   # (B*K, T)
+        log_probs = F.log_softmax(logits, dim=-1)
+        current_logprobs = log_probs.gather(
+            2, m_resp.unsqueeze(-1)
+        ).squeeze(-1)
 
-    # Clipped surrogate
-    unclipped = ratio * adv
-    clipped = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * adv
-    surrogate_loss = -torch.min(unclipped, clipped)
-    surrogate_loss = (surrogate_loss * mask).sum() / n_valid
+        # Importance-sampling ratio
+        ratio = torch.exp(current_logprobs - m_old_lp.detach())
 
-    # KL penalty (MC approximation: log π_θ - log π_ref)
-    kl_per_token = (current_logprobs - group_data.ref_logprobs.detach()) * mask
-    kl = kl_per_token.sum() / n_valid
+        # Broadcast per-sequence advantage to per-token
+        adv = m_adv.detach().unsqueeze(1) * m_resp_mask
 
-    # Combined loss
-    loss = surrogate_loss + cfg.beta * kl
-    loss.backward()
+        # Clipped surrogate
+        unclipped = ratio * adv
+        clipped = torch.clamp(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon) * adv
+        surrogate_loss = -torch.min(unclipped, clipped)
+        surrogate_loss = (surrogate_loss * m_resp_mask).sum() / n_valid
+
+        # KL penalty (MC approximation: log π_θ - log π_ref)
+        kl_per_token = (current_logprobs - m_ref_lp.detach()) * m_resp_mask
+        kl = kl_per_token.sum() / n_valid
+
+        mb_loss = surrogate_loss + cfg.beta * kl
+        mb_loss.backward()
+
+        # Accumulate logging
+        total_loss += mb_loss.item()
+        total_kl += kl.item()
+        with torch.no_grad():
+            _clip = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
+            total_clip += (_clip * m_resp_mask).sum().item() / n_valid.item()
+
+    # Single optimizer step after all mini-batches
     grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_norm=cfg.max_grad_norm)
     optimizer.step()
 
     # Monitoring metrics
     with torch.no_grad():
-        clip_frac = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
-        clip_frac = (clip_frac * mask).sum() / n_valid
-
-        # Pass rate: fraction of completions with r_v = 1
         pass_rate = (group_data.rewards > 0.5).float().mean().item()
 
-        # Degenerate fraction: groups where all K rewards are identical
-        BK = group_data.rewards.shape[0]
         K = cfg.K
         B = BK // K
         rewards_grouped = group_data.rewards.view(B, K)
         degenerate_frac = (rewards_grouped.std(dim=1) < 1e-6).float().mean().item()
 
-        # Mean response length (in tokens)
-        mean_length = (group_data.response_mask.sum(dim=1).float().mean().item())
-
+        mean_length = group_data.response_mask.sum(dim=1).float().mean().item()
         gn = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
     return {
-        "loss": loss.item(),
-        "kl": kl.item(),
-        "clip_frac": clip_frac.item(),
+        "loss": total_loss,
+        "kl": total_kl,
+        "clip_frac": total_clip,
         "pass_rate": pass_rate,
         "degenerate_frac": degenerate_frac,
         "mean_length": mean_length,
