@@ -235,7 +235,7 @@ def ppo_step(
             policy_loss += cfg.kl_coef * (approx_kl * m_resp_mask).sum() / m_valid_tokens
             
             policy_loss.backward()
-            nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+            gn = nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
             policy_optimizer.step()
 
             # -------------------- Value --------------------
@@ -248,8 +248,13 @@ def ppo_step(
             value_optimizer.step()
 
             # Logging accumulation
-            totals["policy_loss"] += policy_loss.item() / (B/mbs)
-            totals["value_loss"] += value_loss.item() / (B/mbs)
+            n_minibatches = B / mbs
+            totals["policy_loss"] += policy_loss.item() / n_minibatches
+            totals["value_loss"] += value_loss.item() / n_minibatches
             totals["kl"] += (approx_kl * m_resp_mask).sum().item() / n_valid
+            with torch.no_grad():
+                _clipped = ((ratio.detach() - 1.0).abs() > cfg.epsilon).float()
+                totals["clip_frac"] += (_clipped * m_resp_mask).sum().item() / n_valid
+            totals["grad_norm"] += (gn.item() if isinstance(gn, torch.Tensor) else float(gn)) / n_minibatches
 
     return {k: v / cfg.ppo_epochs for k, v in totals.items()}
